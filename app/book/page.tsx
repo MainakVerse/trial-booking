@@ -87,7 +87,7 @@ export default function BookPage() {
     return json;
   }, [zone]);
 
-  const loadSlots = useCallback(async () => {
+  const loadSlots = useCallback(async (keepError = false) => {
     if (!zone || !date) return;
     const cached = dayCache.current.get(`${zone}|${date}`);
     if (cached) setDay(cached);
@@ -95,7 +95,7 @@ export default function BookPage() {
     try {
       const json = await fetchDay(date);
       setDay(json);
-      setError(null);
+      if (!keepError) setError(null);
       // Drop a selection that is no longer open, or apply one chosen from a suggestion.
       setSelected((cur) => {
         const open = (iso: string | null) => !!iso && json.slots.some((s) => s.startUtc === iso && s.status === "open");
@@ -155,7 +155,7 @@ export default function BookPage() {
       const json = await res.json();
       if (!res.ok) {
         setError(json.error);
-        loadSlots(); // someone may have taken the slot; refresh what we show
+        loadSlots(true); // someone may have taken the slot; refresh what we show, keep the error visible
         return;
       }
       router.push(json.manageUrl);
@@ -229,6 +229,7 @@ export default function BookPage() {
         {error && (
           <div className="notice notice-error" role="alert">
             <p>{error.message}</p>
+            <button type="button" className="button" onClick={() => setError(null)}>Dismiss</button>
             {suggestions.length > 0 && (
               <div className="suggestions">
                 {suggestions.map((s) => (
