@@ -1,5 +1,6 @@
 import Link from "next/link";
 import DualClock from "@/components/DualClock";
+import { DEFAULT_MENTOR_ZONE } from "@/lib/config";
 
 export default function Home() {
   return (
@@ -12,7 +13,7 @@ export default function Home() {
         </p>
         <Link href="/book" className="button button-primary">Choose a time</Link>
       </div>
-      <DualClock />
+      <DualClock mentorZone={DEFAULT_MENTOR_ZONE} />
     </section>
   );
 }

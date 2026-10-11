@@ -20,6 +20,13 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <Link href="/book" className="header-link">Book a trial class</Link>
         </header>
         <main>{children}</main>
+        <footer className="site-footer">
+          <span>© Codeyoung trial classes</span>
+          <nav aria-label="Staff">
+            <Link href="/mentor">Mentor portal</Link>
+            <Link href="/admin">Admin</Link>
+          </nav>
+        </footer>
       </body>
     </html>
   );

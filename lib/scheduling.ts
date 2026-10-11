@@ -1,12 +1,15 @@
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { DateTime } from "luxon";
 import {
   BOOKING_HORIZON_DAYS,
+  MAX_EMAIL_LENGTH,
   MAX_CLASSES_PER_MENTOR_PER_DAY,
+  MAX_NAME_LENGTH,
   MEETING_BASE_URL,
   MIN_LEAD_MINUTES,
   SLOT_MINUTES,
 } from "./config";
+import { emailKey } from "./email-key";
 import { formatInZone, isValidZone } from "./time";
 import type { Booking, Mentor } from "./types";
 
@@ -17,11 +20,15 @@ import type { Booking, Mentor } from "./types";
  */
 export type SlotStatus = "open" | "full" | "closed";
 
+/** Why a slot is closed, so the UI can say something more useful than "unavailable". */
+export type ClosedReason = "past" | "too_soon" | "too_far" | "no_shift";
+
 export interface Slot {
   startUtc: string;
   endUtc: string;
   status: SlotStatus;
   mentorsFree: number;
+  reason?: ClosedReason;
 }
 
 export interface DayAvailability {
@@ -31,6 +38,10 @@ export interface DayAvailability {
   hoursInDay: number;
   clockChange: boolean;
   slots: Slot[];
+  /** Set when nothing on this day can be booked. */
+  unavailableReason: ClosedReason | "full" | null;
+  /** Nearest open times, filled only when this day has no open slot. */
+  nextAvailable: string[];
 }
 
 export class BookingError extends Error {
@@ -45,7 +56,9 @@ export class BookingError extends Error {
 }
 
 const ms = (d: DateTime) => d.toMillis();
-const str = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+/** Trimmed string with control characters (including CR/LF) removed, so it is safe in emails and logs. */
+const CONTROL_CHARS = new RegExp("[\\u0000-\\u001f\\u007f]", "g");
+const str = (v: unknown) => (typeof v === "string" ? v.replace(CONTROL_CHARS, " ").trim() : "");
 
 /** The mentor's local calendar date for an instant. The daily cap is counted against this. */
 export function mentorDay(instant: DateTime, mentor: Mentor): string {
@@ -111,17 +124,30 @@ export function getDayAvailability(
     const start = t.toUTC();
     const end = start.plus({ minutes: SLOT_MINUTES });
     const base = { startUtc: start.toISO()!, endUtc: end.toISO()! };
-    const working = mentors.some((m) => withinWorkingHours(m, start, end));
-    if (ms(start) < ms(earliest) || ms(start) > ms(latest) || !working) {
-      slots.push({ ...base, status: "closed", mentorsFree: 0 });
-      continue;
+    const closed = (reason: ClosedReason): Slot => ({ ...base, status: "closed", mentorsFree: 0, reason });
+    if (ms(start) < ms(now)) slots.push(closed("past"));
+    else if (ms(start) < ms(earliest)) slots.push(closed("too_soon"));
+    else if (ms(start) > ms(latest)) slots.push(closed("too_far"));
+    else if (!mentors.some((m) => withinWorkingHours(m, start, end))) slots.push(closed("no_shift"));
+    else {
+      const free = freeMentors(start, mentors, bookings).length;
+      slots.push({ ...base, status: free > 0 ? "open" : "full", mentorsFree: free });
     }
-    const free = freeMentors(start, mentors, bookings).length;
-    slots.push({ ...base, status: free > 0 ? "open" : "full", mentorsFree: free });
   }
 
   const hoursInDay = Math.round(dayEnd.diff(dayStart, "hours").hours);
-  return { date: dateISO, timezone: zone, hoursInDay, clockChange: hoursInDay !== 24, slots };
+  const anyOpen = slots.some((s) => s.status === "open");
+  const anyFull = slots.some((s) => s.status === "full");
+  let unavailableReason: DayAvailability["unavailableReason"] = null;
+  if (!anyOpen) {
+    if (anyFull) unavailableReason = "full";
+    else if (ms(dayEnd) <= ms(now)) unavailableReason = "past";
+    else if (ms(dayEnd) <= ms(earliest)) unavailableReason = "too_soon";
+    else if (ms(dayStart) > ms(latest)) unavailableReason = "too_far";
+    else unavailableReason = "no_shift";
+  }
+  const nextAvailable = anyOpen || unavailableReason === "too_far" ? [] : suggestAlternatives(dayStart, zone, mentors, bookings, now);
+  return { date: dateISO, timezone: zone, hoursInDay, clockChange: hoursInDay !== 24, slots, unavailableReason, nextAvailable };
 }
 
 /** Nearest bookable slots at or after `from`, aligned to the parent's local hour. */
@@ -148,7 +174,7 @@ export function suggestAlternatives(
 function pickMentor(candidates: Mentor[], start: DateTime, bookings: Booking[]): Mentor {
   const load = (m: Mentor) => [
     classesOnMentorDay(m, start, bookings),
-    bookings.filter((b) => b.mentorId === m.id).length,
+    bookings.filter((b) => b.mentorId === m.id && b.status === "confirmed").length,
   ];
   return [...candidates].sort((a, b) => {
     const [ad, at] = load(a);
@@ -165,10 +191,10 @@ export interface BookingInput {
 }
 
 /**
- * Validates, assigns a mentor and records the booking.
- * Fully synchronous: in a single Node process the check-and-insert cannot interleave
- * with another request, so two parents can't grab the same last mentor.
- * With a real database, do this inside a transaction with a unique constraint.
+ * Validates, assigns a mentor and builds the booking. Pure: `bookings` must hold the confirmed
+ * bookings only, and the new one is pushed onto it. The caller (lib/booking-service.ts) runs this
+ * inside a database transaction holding an advisory lock, then inserts the result; a partial
+ * unique index on (mentor_id, start_utc) is the final backstop against double-booking.
  */
 export function createBooking(
   input: BookingInput,
@@ -181,7 +207,10 @@ export function createBooking(
   const timezone = str(input.timezone);
 
   if (!parentName) throw new BookingError("INVALID_NAME", "Enter the parent's name.");
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parentEmail)) {
+  if (parentName.length > MAX_NAME_LENGTH) {
+    throw new BookingError("INVALID_NAME", `Name must be ${MAX_NAME_LENGTH} characters or fewer.`);
+  }
+  if (parentEmail.length > MAX_EMAIL_LENGTH || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(parentEmail)) {
     throw new BookingError("INVALID_EMAIL", "Enter a valid email address.");
   }
   if (!isValidZone(timezone)) throw new BookingError("INVALID_TIMEZONE", `Unknown time zone "${timezone}".`);
@@ -206,11 +235,14 @@ export function createBooking(
     throw new BookingError("TOO_FAR", `Trial classes can be booked up to ${BOOKING_HORIZON_DAYS} days ahead.`, 422);
   }
 
-  const existing = bookings.find((b) => b.parentEmail === parentEmail && Date.parse(b.endUtc) > ms(now));
+  const parentKey = emailKey(parentEmail);
+  const existing = bookings.find(
+    (b) => b.status === "confirmed" && b.parentKey === parentKey && Date.parse(b.endUtc) > ms(now),
+  );
   if (existing) {
     throw new BookingError(
       "ALREADY_BOOKED",
-      `${parentEmail} already has a trial class on ${formatInZone(existing.startUtc, timezone)}.`,
+      `${parentEmail} already has a trial class on ${formatInZone(existing.startUtc, timezone)}. Use the link in your confirmation email to change it.`,
       409,
     );
   }
@@ -232,13 +264,19 @@ export function createBooking(
   const id = randomUUID();
   const booking: Booking = {
     id,
+    manageToken: randomBytes(24).toString("base64url"),
     mentorId: mentor.id,
     parentName,
     parentEmail,
+    parentKey,
     parentTimezone: timezone,
     startUtc: start.toISO()!,
     endUtc: start.plus({ minutes: SLOT_MINUTES }).toISO()!,
     meetingLink: `${MEETING_BASE_URL}/${id}`,
+    status: "confirmed",
+    cancelledAt: null,
+    cancelledBy: null,
+    cancelReason: null,
     createdAt: now.toISO()!,
   };
   bookings.push(booking);

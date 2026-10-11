@@ -8,7 +8,7 @@ const NY = "America/New_York";
 const LONDON = "Europe/London";
 
 const mentor = (id: string, startHour = 0, endHour = 24, timezone = IST): Mentor => ({
-  id, name: `Mentor ${id}`, email: `${id}@example.com`, timezone, window: { startHour, endHour },
+  id, name: `Mentor ${id}`, email: `${id}@example.com`, timezone, window: { startHour, endHour }, active: true,
 });
 
 const utc = (iso: string) => DateTime.fromISO(iso, { zone: "utc" });

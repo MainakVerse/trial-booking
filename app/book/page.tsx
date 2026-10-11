@@ -1,20 +1,20 @@
 "use client";
 
 import { DateTime } from "luxon";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { abbr, render } from "@/lib/time";
 
 type SlotStatus = "open" | "full" | "closed";
 interface Slot { startUtc: string; endUtc: string; status: SlotStatus; mentorsFree: number }
-interface DayAvailability { date: string; timezone: string; hoursInDay: number; clockChange: boolean; slots: Slot[] }
-interface ApiError { code: string; message: string; suggestions?: string[] }
-interface Email { to: string; subject: string; body: string }
-interface Confirmation {
-  booking: { id: string; startUtc: string; parentTimezone: string; meetingLink: string };
-  mentor: { name: string; timezone: string };
-  emails: Email[];
+type Unavailable = "past" | "too_soon" | "too_far" | "no_shift" | "full" | null;
+interface DayAvailability {
+  date: string; timezone: string; hoursInDay: number; clockChange: boolean;
+  slots: Slot[]; unavailableReason: Unavailable; nextAvailable: string[];
 }
+interface ApiError { code: string; message: string; suggestions?: string[] }
 
-const ZONES: Array<[string, string]> = [
+const COMMON_ZONES: Array<[string, string]> = [
   ["America/New_York", "US Eastern"],
   ["America/Chicago", "US Central"],
   ["America/Denver", "US Mountain"],
@@ -22,8 +22,6 @@ const ZONES: Array<[string, string]> = [
   ["America/Los_Angeles", "US Pacific"],
   ["Europe/London", "United Kingdom"],
   ["Asia/Kolkata", "India"],
-  ["Asia/Dubai", "United Arab Emirates"],
-  ["Australia/Sydney", "Australia Eastern"],
 ];
 
 const PARTS: Array<[string, number, number]> = [
@@ -35,52 +33,91 @@ const PARTS: Array<[string, number, number]> = [
 
 const HORIZON_DAYS = 30;
 
+const EMPTY_COPY: Record<Exclude<Unavailable, null>, [string, string]> = {
+  past: ["That date has already passed.", "Pick today or a later date."],
+  too_soon: ["It's too late to book a class on this date.", "Classes need to be booked at least 2 hours ahead. Try the next day."],
+  too_far: ["That's further ahead than we take bookings.", `Trial classes can be booked up to ${HORIZON_DAYS} days in advance.`],
+  no_shift: ["No mentors are teaching on this date.", "Try a different day, or see the suggested times below."],
+  full: ["Every mentor is booked for this day.", "Try a different day, or pick one of the nearest open times below."],
+};
+
 const inZone = (iso: string, zone: string) => DateTime.fromISO(iso, { zone: "utc" }).setZone(zone);
+const short = (iso: string, zone: string) => render(inZone(iso, zone), "ccc d LLL, h:mm a");
 
 export default function BookPage() {
+  const router = useRouter();
   const [zone, setZone] = useState("");
+  const [allZones, setAllZones] = useState<string[]>([]);
   const [date, setDate] = useState("");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [day, setDay] = useState<DayAvailability | null>(null);
   const [loading, setLoading] = useState(false);
   const [selected, setSelected] = useState<string | null>(null);
+  const [pendingPick, setPendingPick] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<ApiError | null>(null);
-  const [done, setDone] = useState<Confirmation | null>(null);
+  // Days already fetched, so revisiting a date paints at once while a fresh copy loads behind it.
+  const dayCache = useRef(new Map<string, DayAvailability>());
 
   // Detect the browser zone after mount (avoids a server/client hydration mismatch).
   useEffect(() => {
     const detected = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
     setZone(detected);
     setDate(DateTime.now().setZone(detected).plus({ days: 1 }).toISODate()!);
+    try {
+      setAllZones((Intl as unknown as { supportedValuesOf(k: string): string[] }).supportedValuesOf("timeZone"));
+    } catch {
+      setAllZones([]);
+    }
   }, []);
 
-  const zoneOptions = useMemo(
-    () => (zone && !ZONES.some(([z]) => z === zone) ? [[zone, "Detected"] as [string, string], ...ZONES] : ZONES),
-    [zone],
-  );
+  const commonIds = COMMON_ZONES.map(([z]) => z);
+  const otherZones = useMemo(() => {
+    const rest = allZones.filter((z) => !commonIds.includes(z));
+    return zone && !commonIds.includes(zone) && !rest.includes(zone) ? [zone, ...rest] : rest;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allZones, zone]);
+
+  const fetchDay = useCallback(async (d: string): Promise<DayAvailability> => {
+    const res = await fetch(`/api/slots?date=${d}&tz=${encodeURIComponent(zone)}`);
+    const json = await res.json();
+    if (!res.ok) throw json.error as ApiError;
+    dayCache.current.set(`${zone}|${d}`, json);
+    return json;
+  }, [zone]);
 
   const loadSlots = useCallback(async () => {
     if (!zone || !date) return;
-    setLoading(true);
+    const cached = dayCache.current.get(`${zone}|${date}`);
+    if (cached) setDay(cached);
+    else setLoading(true);
     try {
-      const res = await fetch(`/api/slots?date=${date}&tz=${encodeURIComponent(zone)}`);
-      const json = await res.json();
-      if (!res.ok) throw json.error as ApiError;
+      const json = await fetchDay(date);
       setDay(json);
+      setError(null);
+      // Drop a selection that is no longer open, or apply one chosen from a suggestion.
+      setSelected((cur) => {
+        const open = (iso: string | null) => !!iso && json.slots.some((s) => s.startUtc === iso && s.status === "open");
+        return open(pendingPick) ? pendingPick : open(cur) ? cur : null;
+      });
+      setPendingPick(null);
+      // Warm the next day so stepping forward is instant.
+      const next = DateTime.fromISO(date).plus({ days: 1 }).toISODate()!;
+      if (!dayCache.current.has(`${zone}|${next}`)) fetchDay(next).catch(() => {});
     } catch (e) {
       setDay(null);
-      setError(e as ApiError);
+      setError((e as ApiError)?.message ? (e as ApiError) : { code: "NETWORK", message: "Couldn't load times. Check your connection and try again." });
     } finally {
       setLoading(false);
     }
-  }, [zone, date]);
+  }, [zone, date, pendingPick, fetchDay]);
 
   useEffect(() => {
-    setSelected(null);
     loadSlots();
-  }, [loadSlots]);
+    // Reload only when the zone or date changes, not when pendingPick is consumed.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [zone, date]);
 
   const today = zone ? DateTime.now().setZone(zone) : null;
   const minDate = today?.toISODate() ?? "";
@@ -91,7 +128,7 @@ export default function BookPage() {
     if (!zone || !date || !today) return null;
     const then = DateTime.fromISO(date, { zone }).set({ hour: 12 });
     if (!then.isValid || then.offset === today.offset) return null;
-    return `Clocks in your zone will have changed by this date (${today.offsetNameShort} now, ${then.offsetNameShort} then). The times below already account for it.`;
+    return `Clocks in your zone will have changed by this date (${abbr(today)} now, ${abbr(then)} then). The times below already account for it.`;
   }, [zone, date, today]);
 
   const groups = useMemo(() => {
@@ -121,7 +158,7 @@ export default function BookPage() {
         loadSlots(); // someone may have taken the slot; refresh what we show
         return;
       }
-      setDone(json);
+      router.push(json.manageUrl);
     } catch {
       setError({ code: "NETWORK", message: "Couldn't reach the server. Check your connection and try again." });
     } finally {
@@ -130,56 +167,18 @@ export default function BookPage() {
   }
 
   function pickSuggestion(iso: string) {
-    const local = inZone(iso, zone);
-    setDate(local.toISODate()!);
+    const localDate = inZone(iso, zone).toISODate()!;
     setError(null);
-    setTimeout(() => setSelected(iso), 0); // after the date change resets selection
-  }
-
-  if (done) {
-    const parentTime = inZone(done.booking.startUtc, done.booking.parentTimezone);
-    const mentorTime = inZone(done.booking.startUtc, done.mentor.timezone);
-    return (
-      <section className="confirm" aria-live="polite">
-        <h1>Trial class booked</h1>
-        <p className="confirm-when">
-          {parentTime.toFormat("cccc, d LLLL")}
-          <br />
-          <strong>{parentTime.toFormat("h:mm a")}</strong> {parentTime.offsetNameShort}
-        </p>
-        <p>
-          Your mentor is {done.mentor.name}. For them it is {mentorTime.toFormat("h:mm a 'on' cccc, d LLLL")} in India.
-        </p>
-        <p>
-          Class link: <a href={done.booking.meetingLink}>{done.booking.meetingLink}</a>
-        </p>
-        <details className="emails">
-          <summary>Emails sent ({done.emails.length})</summary>
-          {done.emails.map((m) => (
-            <article key={m.to} className="email">
-              <p className="email-to">To {m.to}</p>
-              <p className="email-subject">{m.subject}</p>
-              <pre>{m.body}</pre>
-            </article>
-          ))}
-        </details>
-        <button
-          className="button button-secondary"
-          onClick={() => {
-            setDone(null);
-            setSelected(null);
-            setName("");
-            setEmail("");
-            loadSlots();
-          }}
-        >
-          Book another class
-        </button>
-      </section>
-    );
+    if (localDate === date) setSelected(iso);
+    else {
+      setPendingPick(iso);
+      setDate(localDate);
+    }
   }
 
   const canSubmit = !!selected && name.trim() && email.trim() && !submitting;
+  const suggestions = error?.suggestions?.length ? error.suggestions : [];
+  const empty = day && groups.length === 0 ? EMPTY_COPY[day.unavailableReason ?? "no_shift"] : null;
 
   return (
     <div className="booking">
@@ -198,30 +197,31 @@ export default function BookPage() {
         <label>
           Your time zone
           <select value={zone} onChange={(e) => setZone(e.target.value)}>
-            {zoneOptions.map(([z, label]) => (
-              <option key={z} value={z}>{label} ({z})</option>
-            ))}
+            <optgroup label="Common">
+              {COMMON_ZONES.map(([z, label]) => <option key={z} value={z}>{label} ({z})</option>)}
+            </optgroup>
+            {otherZones.length > 0 && (
+              <optgroup label="All time zones">
+                {otherZones.map((z) => <option key={z} value={z}>{z.replace(/_/g, " ")}</option>)}
+              </optgroup>
+            )}
           </select>
         </label>
         <label>
           Date
-          <input type="date" value={date} min={minDate} max={maxDate} onChange={(e) => setDate(e.target.value)} />
+          <input type="date" value={date} min={minDate} max={maxDate} onChange={(e) => e.target.value && setDate(e.target.value)} />
         </label>
         <label>
           Parent's name
-          <input value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" required />
+          <input value={name} onChange={(e) => setName(e.target.value)} autoComplete="name" maxLength={100} required />
         </label>
         <label>
           Email
-          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
+          <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" maxLength={254} required />
         </label>
 
         <button type="submit" className="button button-primary" disabled={!canSubmit}>
-          {submitting
-            ? "Booking…"
-            : selected
-              ? `Book ${inZone(selected, zone).toFormat("ccc d LLL, h:mm a")}`
-              : "Pick a time to book"}
+          {submitting ? "Booking…" : selected ? `Book ${short(selected, zone)}` : "Pick a time to book"}
         </button>
       </form>
 
@@ -229,12 +229,10 @@ export default function BookPage() {
         {error && (
           <div className="notice notice-error" role="alert">
             <p>{error.message}</p>
-            {!!error.suggestions?.length && (
+            {suggestions.length > 0 && (
               <div className="suggestions">
-                {error.suggestions.map((s) => (
-                  <button key={s} type="button" className="slot" onClick={() => pickSuggestion(s)}>
-                    {inZone(s, zone).toFormat("ccc d LLL, h:mm a")}
-                  </button>
+                {suggestions.map((s) => (
+                  <button key={s} type="button" className="slot" onClick={() => pickSuggestion(s)}>{short(s, zone)}</button>
                 ))}
               </div>
             )}
@@ -242,18 +240,31 @@ export default function BookPage() {
         )}
         {day?.clockChange && (
           <div className="notice">
-            Clocks change on this date, so it has {day.hoursInDay} hours. The times below already account for it.
+            <p>Clocks change on this date, so it has {day.hoursInDay} hours. The times below already account for it.</p>
           </div>
         )}
-        {!day?.clockChange && offsetNote && <div className="notice">{offsetNote}</div>}
+        {!day?.clockChange && offsetNote && <div className="notice"><p>{offsetNote}</p></div>}
 
         {loading && !day && <p className="muted">Loading times…</p>}
 
-        {day && groups.length === 0 && (
+        {empty && (
           <div className="empty">
-            <p>No classes can be booked on this date.</p>
-            <p className="muted">Try the next day, or a date further out if this one is too soon.</p>
+            <p><strong>{empty[0]}</strong></p>
+            <p className="muted">{empty[1]}</p>
           </div>
+        )}
+        {day && day.nextAvailable.length > 0 && (
+          <div>
+            <p className="muted">Nearest open times</p>
+            <div className="suggestions">
+              {day.nextAvailable.map((s) => (
+                <button key={s} type="button" className="slot" onClick={() => pickSuggestion(s)}>{short(s, zone)}</button>
+              ))}
+            </div>
+          </div>
+        )}
+        {day && day.unavailableReason === "full" && day.nextAvailable.length === 0 && (
+          <p className="muted">No mentor has a free hour in the next {HORIZON_DAYS} days. Please check back later or contact support.</p>
         )}
 
         {groups.map((g) => (
@@ -273,9 +284,7 @@ export default function BookPage() {
                     onClick={() => setSelected(s.startUtc)}
                   >
                     <span className="slot-time">{t.toFormat("h:mm a")}</span>
-                    <span className="slot-sub">
-                      {s.status === "full" ? "Fully booked" : `${t.offsetNameShort}`}
-                    </span>
+                    <span className="slot-sub">{s.status === "full" ? "Fully booked" : abbr(t)}</span>
                   </button>
                 );
               })}
